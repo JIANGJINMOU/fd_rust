@@ -1,0 +1,228 @@
+use ansi_term::Color;
+use clap::Parser;
+use ignore::WalkBuilder;
+use regex::Regex;
+use std::fs::File;
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
+use std::ptr;
+use winapi::um::errhandlingapi::GetLastError;
+use winapi::um::winbase::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, GetFileAttributesW};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "A fast command-line search tool for Windows", long_about = None)]
+struct Args {
+    /// 搜索模式（文件名或内容）
+    pattern: String,
+
+    /// 搜索目录，默认为当前目录
+    #[arg(short, long, default_value = ".")]
+    directory: String,
+
+    /// 搜索文件内容而非文件名
+    #[arg(short, long)]
+    content: bool,
+
+    /// 不区分大小写
+    #[arg(short, long)]
+    case_insensitive: bool,
+
+    /// 不递归搜索子目录
+    #[arg(short, long)]
+    no_recurse: bool,
+
+    /// 显示匹配行的上下文行数
+    #[arg(short, long, default_value_t = 0)]
+    context: usize,
+
+    /// 只搜索指定类型的文件（例如：rs,txt）
+    #[arg(short, long)]
+    ext: Option<String>,
+
+    /// 包含隐藏文件和系统文件
+    #[arg(short, long)]
+    include_hidden: bool,
+}
+
+/// 检查路径是否为Windows隐藏文件或系统文件
+fn is_hidden_or_system(path: &Path) -> bool {
+    // 将Path转换为Windows宽字符串
+    let wide_path = path.to_str().and_then(|s| {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into()
+    });
+
+    if let Some(wide_path) = wide_path {
+        let attrs = unsafe { GetFileAttributesW(wide_path.as_ptr()) };
+        if attrs != u32::MAX {
+            return (attrs & FILE_ATTRIBUTE_HIDDEN) != 0 || (attrs & FILE_ATTRIBUTE_SYSTEM) != 0;
+        }
+    }
+
+    false
+}
+
+fn main() -> io::Result<()> {
+    let args = Args::parse();
+    let search_dir = Path::new(&args.directory);
+
+    // 验证目录是否存在
+    if !search_dir.exists() || !search_dir.is_dir() {
+        eprintln!(
+            "{}: 目录不存在或不是有效的目录",
+            Color::Red.paint(args.directory)
+        );
+        std::process::exit(1);
+    }
+
+    // 准备正则表达式
+    let regex_options = if args.case_insensitive {
+        regex::RegexBuilder::new(&args.pattern)
+            .case_insensitive(true)
+            .build()
+    } else {
+        Regex::new(&args.pattern)
+    };
+
+    let regex = match regex_options {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}: 无效的正则表达式: {}", Color::Red.paint("错误"), e);
+            std::process::exit(1);
+        }
+    };
+
+    // 准备文件扩展名过滤器
+    let exts: Option<Vec<&str>> = args.ext.as_ref().map(|s| s.split(',').collect());
+
+    // 构建文件遍历器
+    let mut walk_builder = WalkBuilder::new(search_dir);
+
+    // 设置递归选项
+    if args.no_recurse {
+        walk_builder.max_depth(1);
+    }
+
+    // 配置忽略规则
+    walk_builder.hidden(false); // 我们自己处理隐藏文件判断
+    walk_builder.gitignore(true);
+
+    // 遍历文件系统
+    let walker = walk_builder.build();
+
+    let mut found_count = 0;
+
+    for result in walker {
+        match result {
+            Ok(entry) => {
+                let path = entry.path();
+
+                // 只处理文件
+                if !path.is_file() {
+                    continue;
+                }
+
+                // 处理Windows隐藏文件和系统文件
+                if !args.include_hidden && is_hidden_or_system(path) {
+                    continue;
+                }
+
+                // 检查文件扩展名（如果指定）
+                if let Some(exts) = &exts {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+                    if !exts.contains(&ext) {
+                        continue;
+                    }
+                }
+
+                // 如果是搜索文件名
+                if !args.content {
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if regex.is_match(file_name) {
+                            println!("{}", Color::Green.paint(path.display().to_string()));
+                            found_count += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // 如果是搜索文件内容
+                match search_file_content(path, &regex, args.context) {
+                    Ok(matches) => {
+                        found_count += matches;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{}: 无法读取文件 {}: {}",
+                            Color::Yellow.paint("警告"),
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{}: 无法访问路径: {}", Color::Yellow.paint("警告"), e);
+            }
+        }
+    }
+
+    println!(
+        "\n{}: 找到 {} 个匹配项",
+        Color::Cyan.paint("结果"),
+        found_count
+    );
+
+    Ok(())
+}
+
+/// 搜索文件内容并显示匹配的行
+fn search_file_content(path: &PathBuf, regex: &Regex, context: usize) -> io::Result<usize> {
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+    let mut matches = 0;
+    let mut display_path = true;
+
+    for (line_num, line) in lines.iter().enumerate() {
+        if regex.is_match(line) {
+            if display_path {
+                println!("\n{}", Color::Green.paint(path.display().to_string()));
+                display_path = false;
+            }
+
+            // 显示上下文行
+            let start = if line_num >= context {
+                line_num - context
+            } else {
+                0
+            };
+            let end = (line_num + context).min(lines.len() - 1);
+
+            for i in start..=end {
+                let line_number = i + 1; // 行号从1开始
+                let prefix = if i == line_num {
+                    Color::Red.paint(format!("{}:", line_number))
+                } else {
+                    Color::White.paint(format!("{}:", line_number))
+                };
+
+                // 高亮显示匹配的部分
+                let highlighted_line = regex.replace_all(&lines[i], |caps: &regex::Captures| {
+                    Color::Yellow.paint(&caps[0]).to_string()
+                });
+
+                println!("{} {}", prefix, highlighted_line);
+            }
+
+            matches += 1;
+        }
+    }
+
+    Ok(matches)
+}

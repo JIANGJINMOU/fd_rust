@@ -1,0 +1,13 @@
+[package]
+name = "fd_rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+walkdir = "2.3"
+regex = "1.10"
+ignore = "0.4"  # 用于处理忽略规则
+ansi_term = "0.12"  # 用于命令行彩色输出
+winapi = { version = "0.3", features = ["winbase", "fileapi", "errhandlingapi"] }  # Windows特定API
+
